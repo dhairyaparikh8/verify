@@ -193,11 +193,11 @@ export default function Page() {
                   key={idx}
                   className="p-6 border border-slate-200 dark:border-slate-700 rounded-lg hover:border-blue-400 dark:hover:border-blue-500 transition"
                 >
-                  <div className="text-3xl font-bold text-blue-600 dark:text-blue-400 mb-3">
-                    {item.year}
-                  </div>
                   <h3 className="text-xl font-semibold mb-2">{item.title}</h3>
                   <p className="text-slate-600 dark:text-slate-400">{item.description}</p>
+                  <div className="text-3xl font-bold text-blue-600 dark:text-blue-400 mt-4">
+                    {item.year}
+                  </div>
                 </div>
               ))}
             </div>
