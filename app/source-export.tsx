@@ -1,8 +1,9 @@
 /*
  * COMPLETE CLIENT-SIDE SOURCE EXPORT
  *
- * This file is a standalone, copyable client-side version of the configurable
- * credibility analyzer UI. It includes the theme/config shape, landing-page
+ * This file is the complete, standalone, copyable client-side source for the
+ * configurable credibility analyzer UI. It is provided as a separate file so
+ * the full implementation can be copied or downloaded independently. It includes the theme/config shape, landing-page
  * sections, customization modal, and analyzer display. For production live
  * verification, connect the analyze request to the server route at
  * /api/analyze and keep evidence adapters server-side.
