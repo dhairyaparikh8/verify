@@ -1,0 +1,83 @@
+VERIFYTODAY SOURCE BUNDLE
+
+=== app/api/analyze/route.ts ===
+import { NextRequest, NextResponse } from 'next/server'
+import { extractClaim, classifyArticle } from '@/lib/claim-analysis'
+import { searchNews } from '@/lib/news'
+import { calculateCredibilityScore, type Evidence } from '@/lib/credibility-engine'
+
+export const runtime = 'nodejs'
+export const maxDuration = 30
+
+const insufficient = (reason = 'No relevant evidence was found.') => NextResponse.json({ verdict: 'insufficient', confidence: 0, confidenceReason: reason, summary: 'No reliable reporting was found for this claim.', uncertainty: 'This means there is insufficient evidence, not that the claim is false.', evidence: [], sourceCount: 0, verificationTimestamp: new Date().toISOString() })
+
+export async function POST(request: NextRequest) {
+  try {
+    const body = (await request.json()) as { input?: unknown; isUrl?: boolean }
+    if (typeof body.input !== 'string' || !body.input.trim()) return NextResponse.json({ error: 'Please provide a claim, headline, article text, or URL.' }, { status: 400 })
+    const input = body.input.trim().slice(0, 2000)
+    if (!process.env.NEWS_API_KEY) return insufficient('The evidence provider is not configured. No score was produced.')
+    const { claim, queries } = extractClaim(input, body.isUrl === true)
+    const articles = (await Promise.all(queries.map(searchNews))).flat().filter((article, index, all) => all.findIndex((item) => item.url === article.url) === index).slice(0, 30)
+    if (!articles.length) return insufficient()
+    const evidence: Evidence[] = []
+    for (const article of articles) {
+      const result = classifyArticle(claim, article)
+      if (result.classification === 'IRRELEVANT') continue
+      evidence.push({ source: article.sourceName, url: article.url, text: result.reason, timestamp: article.publishedAt ?? undefined, supports: result.classification === 'SUPPORTS', contradicts: result.classification === 'CONTRADICTS' })
+    }
+    const sourceCount = new Set(evidence.map((item) => item.source)).size
+    return NextResponse.json(calculateCredibilityScore({ evidence, sourceCount }))
+  } catch {
+    return insufficient('The evidence service could not complete this check. No score was produced.')
+  }
+}
+
+=== lib/news.ts ===
+import { getTrustedSource, normalizeDomain } from './trustedSources'
+export type NewsArticle = { title: string; description: string | null; sourceName: string; sourceDomain: string; url: string; publishedAt: string | null; content: string | null; weight: number }
+type NewsApiArticle = { title?: string | null; description?: string | null; content?: string | null; url?: string | null; publishedAt?: string | null; source?: { name?: string | null } }
+function validDate(value: string | null | undefined) { return value && !Number.isNaN(Date.parse(value)) ? value : null }
+export async function searchNews(query: string): Promise<NewsArticle[]> {
+  const key = process.env.NEWS_API_KEY
+  if (!key) return []
+  const params = new URLSearchParams({ q: query.slice(0, 300), language: 'en', sortBy: 'relevancy', pageSize: '20', apiKey: key })
+  const controller = new AbortController(); const timeout = setTimeout(() => controller.abort(), 8000)
+  try {
+    const response = await fetch(`https://newsapi.org/v2/everything?${params}`, { signal: controller.signal, cache: 'no-store' })
+    if (!response.ok) return []
+    const data = (await response.json()) as { status?: string; articles?: NewsApiArticle[] }
+    if (data.status !== 'ok' || !Array.isArray(data.articles)) return []
+    return data.articles.flatMap((article) => {
+      if (!article.url || !article.title) return []
+      const domain = normalizeDomain(article.url); const trusted = getTrustedSource(article.url)
+      if (!domain || !trusted) return []
+      return [{ title: article.title, description: article.description ?? null, sourceName: article.source?.name || trusted.name, sourceDomain: domain, url: article.url, publishedAt: validDate(article.publishedAt), content: article.content ?? null, weight: trusted.weight }]
+    })
+  } catch { return [] } finally { clearTimeout(timeout) }
+}
+
+=== lib/trustedSources.ts ===
+export type TrustedSource = { domain: string; name: string; weight: number }
+export const TRUSTED_SOURCES: TrustedSource[] = [
+  { domain: 'reuters.com', name: 'Reuters', weight: 1 }, { domain: 'apnews.com', name: 'Associated Press', weight: 1 }, { domain: 'bbc.com', name: 'BBC', weight: .95 }, { domain: 'theguardian.com', name: 'The Guardian', weight: .95 }, { domain: 'nytimes.com', name: 'The New York Times', weight: .95 }, { domain: 'thehindu.com', name: 'The Hindu', weight: .95 }, { domain: 'indianexpress.com', name: 'The Indian Express', weight: .95 }, { domain: 'aljazeera.com', name: 'Al Jazeera', weight: .9 }, { domain: 'cnn.com', name: 'CNN', weight: .9 }, { domain: 'npr.org', name: 'NPR', weight: .9 }, { domain: 'hindustantimes.com', name: 'Hindustan Times', weight: .9 }, { domain: 'indiatoday.in', name: 'India Today', weight: .9 },
+]
+export function normalizeDomain(value: string): string | null { try { return new URL(value).hostname.toLowerCase().replace(/^www\./, '') || null } catch { return null } }
+export function getTrustedSource(value: string): TrustedSource | null { const domain = normalizeDomain(value); if (!domain) return null; return TRUSTED_SOURCES.find((source) => domain === source.domain || domain.endsWith(`.${source.domain}`)) ?? null }
+
+=== lib/claim-analysis.ts ===
+import type { NewsArticle } from './news'
+const STOP_WORDS = new Set('the a an and or but is are was were to of in on for from with this that as at by about into it its be has have had new how why what when where who'.split(' '))
+export function extractClaim(input: string, isUrl: boolean) { const cleaned = input.trim(); if (isUrl) return { claim: cleaned, queries: [cleaned] }; const claim = cleaned.replace(/https?:\/\/\S+/g, '').replace(/\s+/g, ' ').trim().slice(0, 500); const terms = claim.split(/[^A-Za-z0-9'-]+/).filter((term) => term.length > 2 && !STOP_WORDS.has(term.toLowerCase())).slice(0, 8); const query = terms.join(' ') || claim; return { claim: claim || cleaned, queries: [query, terms.slice(0, 5).join(' ')].filter(Boolean).slice(0, 2) } }
+export function classifyArticle(claim: string, article: NewsArticle) { const text = `${article.title} ${article.description ?? ''} ${article.content ?? ''}`.toLowerCase(); const terms = claim.toLowerCase().split(/[^a-z0-9]+/).filter((term) => term.length > 3 && !STOP_WORDS.has(term)); const matches = terms.filter((term) => text.includes(term)).length; const relevance = terms.length ? matches / Math.min(terms.length, 8) : 0; const contradiction = /false|denied|did not|no evidence|debunk|incorrect|wrong|misleading|fabricated|untrue|not true/.test(text); if (relevance < .34) return { classification: 'IRRELEVANT' as const, reason: "The article does not contain enough of the claim's identifying terms." }; if (contradiction) return { classification: 'CONTRADICTS' as const, reason: 'The article includes language indicating the claim or a key detail is disputed.' }; if (relevance >= .6) return { classification: 'SUPPORTS' as const, reason: 'The article reports the same identifiable event or facts as the submitted claim.' }; return { classification: 'MENTIONS' as const, reason: 'The article is related but does not directly establish the complete claim.' } }
+
+=== lib/credibility-engine.ts ===
+export type Verdict = 'verified' | 'mixed' | 'unsupported' | 'insufficient'
+export interface Evidence { source: string; url?: string; text: string; timestamp?: string; supports?: boolean; contradicts?: boolean }
+export interface CredibilityResult { verdict: Verdict; confidence: number; confidenceReason: string; evidence: Evidence[]; summary: string; uncertainty?: string; sourceCount: number; verificationTimestamp: string }
+export function calculateCredibilityScore(input: { evidence: Evidence[]; sourceCount: number }): CredibilityResult { const { evidence, sourceCount } = input; const supporting = new Set(evidence.filter((item) => item.supports).map((item) => item.source)).size; const contradicting = new Set(evidence.filter((item) => item.contradicts).map((item) => item.source)).size; const relevant = evidence.filter((item) => item.supports || item.contradicts).length; const base = { evidence, sourceCount, verificationTimestamp: new Date().toISOString() }; if (!relevant) return { ...base, verdict: 'insufficient', confidence: 0, confidenceReason: 'No relevant evidence was found.', summary: 'No reliable reporting was found for this claim.', uncertainty: 'This means there is insufficient evidence, not that the claim is false.' }; if (supporting > 0 && contradicting > 0) return { ...base, verdict: contradicting >= supporting ? 'unsupported' : 'mixed', confidence: Math.min(.78, .42 + Math.max(supporting, contradicting) * .08), confidenceReason: `Trusted sources disagree: ${supporting} support and ${contradicting} contradict.`, summary: `Evidence is conflicting across ${sourceCount} independent publisher${sourceCount === 1 ? '' : 's'}.`, uncertainty: 'The disagreement may concern a central claim or a detail; review the cited articles.' }; if (supporting >= 2) return { ...base, verdict: 'verified', confidence: Math.min(.95, .68 + supporting * .08), confidenceReason: `${supporting} independent trusted publishers provide relevant supporting evidence.`, summary: `The claim is supported by reporting from ${supporting} independent trusted publishers.`, uncertainty: sourceCount < 3 ? 'The evidence base is limited and may change as new reporting emerges.' : undefined }; if (contradicting >= 2) return { ...base, verdict: 'unsupported', confidence: Math.min(.9, .68 + contradicting * .08), confidenceReason: `${contradicting} independent trusted publishers provide relevant contradictory evidence.`, summary: 'Multiple independent sources contradict the central claim.', uncertainty: 'This result reflects the retrieved reporting and is not a substitute for reviewing primary evidence.' }; return { ...base, verdict: 'insufficient', confidence: .35, confidenceReason: 'Only one independent publisher provided relevant evidence, which is not enough for a strong determination.', summary: 'Some related reporting was found, but there is insufficient independent evidence for a reliable verdict.', uncertainty: 'A single report is not treated as independent corroboration.' } }
+
+=== Required environment ===
+NEWS_API_KEY=server-only
+
+The existing UI files remain unchanged. The client calls POST /api/analyze with { input, isUrl }.
